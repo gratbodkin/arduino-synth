@@ -1,36 +1,58 @@
-#include <avr/eeprom.h>
-#include <avr/pgmspace.h>
-#include <Arduino.h>
-// Included Header Files
+
 #include <MozziGuts.h>
-#include <mozzi_analog.h>
-#include <AutoMap.h> // maps unpredictable inputs to a range
-#include <IntMap.h>
-#include <Oscil.h>
-#include <Smooth.h>
-#include <mozzi_midi.h>
-#include <mozzi_fixmath.h> //Used for MIDI calcs.  See MIDI.h & mozzi_midi.h to see where it's used
-#include <ADSR.h>
-#include <LowPassFilter.h>
-#include <RCpoll.h>
-// Oscillator Tables used for output Waveshape
+#include <Oscil.h> // oscillator 
+#include <tables/cos2048_int8.h> // table for Oscils to play
 #include <tables/sin2048_int8.h>
 #include <tables/triangle2048_int8.h>
 #include <tables/saw2048_int8.h>
 #include <tables/square_no_alias_2048_int8.h>
-// Oscillator Tables used for Low Frequency Oscillator (LFO)
-#include <tables/sin512_int8.h>
-#include <tables/saw512_int8.h>
-#include <tables/triangle512_int8.h>
-#include <tables/square_no_alias512_int8.h>
-#define CONTROL_RATE 32 // comment out to use default control rate of 64
-#define NOTES_PER_SCALE 8
-#define NUM_OSCILLATORS 8
-#define NUM_CONTROLS 10
-#define SIN 0
-#define SAW 1
-#define SQUARE 2
-#define TRIANGLE 3
+#include <Smooth.h>
+#include <AutoMap.h> // maps unpredictable inputs to a range
+#include <DCfilter.h>
+#include <mozzi_midi.h>
+#include <ADSR.h>
+#include <EventDelay.h>
+#include <Ead.h>
+#include <Smooth.h>
+#include <LowPassFilter.h>
+#include <StateVariable.h>
+#include <AudioDelayFeedback.h>
+#include <AudioDelay.h>
+// desired carrier frequency max and min, for AutoMap
+const int MIN_CARRIER_FREQ = 22;
+const int MAX_CARRIER_FREQ = 440;
+// desired intensity max and min, for AutoMap, note they're inverted for reverse dynamics
+const int MIN_INTENSITY = 700;
+const int MAX_INTENSITY = 10;
+// desired mod speed max and min, for AutoMap, note they're inverted for reverse dynamics
+const int MIN_MOD_SPEED = 10000;
+const int MAX_MOD_SPEED = 1;
+//***********  Param Value Maps **********
+AutoMap kMapIntensity(0,1023,MAX_INTENSITY,MIN_INTENSITY);
+AutoMap kMapModSpeed(0,1023,MAX_MOD_SPEED,MIN_MOD_SPEED);
+AutoMap kRatioMap(0,1023,0,5);
+AutoMap kFreqShiftMap(0,1023,0,12);
+AutoMap kMapWaveform(0,1023,0,3);
+AutoMap kMapOctave(0,1023,3,6);
+AutoMap kGainMap(0,1023,0,255);
+AutoMap kAttackTimeMap(0,1023,40,2500);
+AutoMap kDecayTimeMap(0,1023,58,2500);
+AutoMap kDelayTimeMap(0,1023,1600,16384);
+AutoMap kDelayFeedbackMap(0,1023,-128,127);
+AutoMap kDelayWetMap(0,1023,8,1);
+//***********  Knob Pin Defs **********
+#define KNOB_PIN 0
+#define GAIN_PIN 1
+#define FM_INTESNSITY_PIN 2
+#define MOD_FREQ_PIN 3
+#define RATIO_PIN 4
+#define WAVEFORM_PIN 5
+#define LFO_WAVEFORM_PIN 6
+#define FREQ_SHIFT_PIN 7
+#define ATTACK_PIN 8
+#define DECAY_PIN 9
+#define CUTOFF_PIN 9
+//***********  Note Trigger Pin Defs **********
 #define NOTE1 49
 #define NOTE2 48
 #define NOTE3 47
@@ -39,8 +61,12 @@
 #define NOTE6 44
 #define NOTE7 43
 #define NOTE8 42
-#define TOGGLEUP 12
-#define TOGGLEDOWN 13
+//***********  3 Position Switch Pin Defs **********
+#define TOGGLEUP 53
+// #define TOGGLEDOWN 52
+#define SHIFT_FN_PIN 52
+#define SHIFT_BTN 2
+//***********  Trigger Btn LED Pin Defs **********
 #define NOTE1LED 30
 #define NOTE2LED 31
 #define NOTE3LED 32
@@ -49,35 +75,44 @@
 #define NOTE6LED 36
 #define NOTE7LED 35
 #define NOTE8LED 34
-
-#define OCTAVE_PIN 0
-#define GAIN_PIN 1
-#define OSC_FREQ_PIN 2
-#define RELEASE_PIN 3
-#define ATTACK_PIN 4
-#define WAVEFORM_PIN 5
-#define LFOWaveForm_PIN 6
-#define LFO_FREQ_PIN 7
-#define LFO_DEPTH_PIN 8
-#define CUTOFF_PIN 9
-
-Oscil < SIN2048_NUM_CELLS, AUDIO_RATE > oscillators[NOTES_PER_SCALE];
-Oscil < SIN2048_NUM_CELLS, AUDIO_RATE > oscillators2[NOTES_PER_SCALE];
-ADSR < CONTROL_RATE, CONTROL_RATE > oscEnvelopes[NUM_OSCILLATORS];
-Oscil < 512, AUDIO_RATE > lfo(SIN512_DATA);
-LowPassFilter filters[NOTES_PER_SCALE];
-
-uint8_t resLookup[4] =
+#define STACK_SIZE 8
+#define CONTROL_RATE 64 // powers of 2 please
+#define SIN 0
+#define SAW 1
+#define SQUARE 2
+#define TRIANGLE 3
+#define NOTES_PER_SCALE 8
+// unsigned int duration, attack, decay, sustain, release_ms;
+unsigned int ADSRValues[4] = {50, 500, 1000, 1000};
+Smooth <unsigned int> kSmoothFreq(0.85f);
+// int lfoWaveform = 0;
+int midiNoteValue;
+int octave = 3;
+int newNote = 0;
+int curNote = 0;
+int curScale = 4;
+int inKey = 0;
+int freqShift = 0;
+int rootNote = 0;
+int prevNoteNumber = 0;
+int curStackIndex = 0;
+boolean shiftActive = false;
+Q16n16 deltime;
+int delayWet = 1;
+int noteStack[STACK_SIZE] = 
 {
-    180, 190, 35, 190
+    0, 0, 0, 0, 0, 0, 0, 0
 };
-
+uint8_t noteBtnValues = 0x00;
+uint8_t switchValues = 0x00;
+uint8_t prevSwitchValues = 0x00;
+uint8_t prevNoteBtnValues = 0x00;
 uint8_t triggerValues[8] =
 {
     0, 0, 0, 0, 0, 0, 0, 0
 };
 
-const int scaleArray[][NOTES_PER_SCALE] =
+const int scaleArray[][8] =
 {
     {
         0, 2, 4, 5, 7, 9, 11, 12
@@ -93,58 +128,32 @@ const int scaleArray[][NOTES_PER_SCALE] =
     },
     {
         0, 2, 3, 5, 7, 8, 10, 12
+    },
+    {
+        -12, -9, -7, -4, 0, 3, 7, 12
+    },
+    {
+        -16, -14, -12, -4, 0, 3, 7, 8
     }
 };
-
-uint8_t gain_adsr[8] =
-{
-    0, 0, 0, 0, 0, 0, 0, 0
-};
-
-// -- Global variable declarations ----------------------------------------------------------------------------
-boolean notePressedFlag = false;
-int inScale = 4;
-int inKey = 0;
-int newNote = 0;
-int curControl = 0;
-int waveform = 0;
-int waveformCheck = 0;
-uint8_t noteBtnValues = 0x00;
-uint8_t prevNoteBtnValues = 0x00;
-uint8_t gain_lfo1; // Stores gain multiplier contributed by lfo.
+int gain;
+uint8_t outGain;
+Oscil<COS2048_NUM_CELLS, AUDIO_RATE> aCarrier(COS2048_DATA);
+Oscil<COS2048_NUM_CELLS, AUDIO_RATE> aModulator(COS2048_DATA);
+Oscil<COS2048_NUM_CELLS, CONTROL_RATE> kIntensityMod(COS2048_DATA);
+ADSR <CONTROL_RATE, CONTROL_RATE> envelopeAmp;
+// AudioDelayFeedback <128> aDel;
+AudioDelay <128> aDel;
+byte ampEnvGain = 0;
+int carrier_freq;
+int mod_ratio = 5; // brightness (harmonics)
+long fm_intensity; // carries control info from updateControl to updateAudio
+// smoothing for intensity to remove clicks on transitions
+float smoothness = 0.95f;
+Smooth <long> aSmoothIntensity(smoothness);
 
 
-const IntMap waveIntMap(0, 1023, 0, 5);
-unsigned int octave = 3;
-const IntMap kMapOctave(0, 1023, 3, 8);
-unsigned int attack_ms; // Attack time, milliseconds.
-const IntMap attackIntMap(0, 1023, 28, 1000); // Min value must be large enough to prevent click at note start.
-unsigned int release_ms; // Decay time, milliseconds.
-const IntMap releaseIntMap(0, 1023, 25, 1000); // Min value must be large enough to prevent click at note end.
-char LFOWaveForm;
-int LFOwaveformCheck;
-const IntMap lfo_waveIntMap(0, 1023, 1, 5); // 1,5 returns 1-2-3-4.
-unsigned int lfo_speed;
-const IntMap lfo_speedIntMap(0, 1023, 0, 1400); //
-unsigned int cutoff;
-const IntMap cutoffIntMap(0, 1023, 30, 180); // Valid range 0-255 corresponds to freq 0-8192 (audio rate/2).
-uint8_t lfo_depth;
-const IntMap lfo_depthIntMap(0, 1023, 1, 255); // LFO depth, as a percent multiplier of cutoff. 1=0% of cutoff, 256=100% of cutoff.
-int gain = 255;
-const IntMap gainMap(0, 1023, 1, 128);
-float detuneAmount = 0; // Store the output waveform selection 1-2-3-4
-const IntMap detuneMap(0, 1023, 0, 1000); // returns 1-2-3-4.
-uint8_t ledPinValues = 0x00;
-const IntMap kMapScale(0, 1023, 0, 5);
-const IntMap kMapKeyOffset(0, 1023, 0, 11);
-int midiNoteValue;
-int freq;
-// -----------------------------------------------------------------------------------------
-void setup()
-{
-
-    Serial.begin(9600);
-    startMozzi(CONTROL_RATE); // Start the use of Mozzi with defined CONTROL_RATE
+void setup(){
     pinMode(NOTE1, INPUT_PULLUP);
     pinMode(NOTE2, INPUT_PULLUP);
     pinMode(NOTE3, INPUT_PULLUP);
@@ -156,8 +165,7 @@ void setup()
     pinMode(NOTE7, INPUT_PULLUP);
     pinMode(NOTE8, INPUT_PULLUP);
     pinMode(TOGGLEUP, INPUT_PULLUP);
-    pinMode(TOGGLEDOWN, INPUT_PULLUP);
-
+    pinMode(SHIFT_FN_PIN, INPUT_PULLUP);
     pinMode(NOTE1LED, OUTPUT);
     pinMode(NOTE2LED, OUTPUT);
     pinMode(NOTE3LED, OUTPUT);
@@ -166,20 +174,166 @@ void setup()
     pinMode(NOTE6LED, OUTPUT);
     pinMode(NOTE7LED, OUTPUT);
     pinMode(NOTE8LED, OUTPUT);
-    for (int i = 0; i < 8; i++)
-    {
-        oscillators[i] = Oscil < SIN2048_NUM_CELLS, AUDIO_RATE > (SIN2048_DATA);
-        oscillators2[i] = Oscil < SIN2048_NUM_CELLS, AUDIO_RATE > (SIN2048_DATA);
-        oscEnvelopes[i].setADLevels(200, 200);
-        oscEnvelopes[i].setDecayTime(30000);
-        oscEnvelopes[i].setSustainTime(32500);
-        oscEnvelopes[i].setReleaseLevel(0);
-    }
+    Serial.begin(9600); // for Teensy 3.1, beware printout can cause glitches
+    envelopeAmp.setADLevels(255, 200);
+    envelopeAmp.setDecayTime(100);
+    envelopeAmp.setSustainTime(32500);
+    aModulator.setFreq(0);
+    aCarrier.setFreq(0); 
+    startMozzi(CONTROL_RATE); // :))
 }
 
-void loop()
+
+void updateControl(){
+  noteBtnValues = (~PINL);
+  switchValues = (~PINB & 0b11);
+  if(prevSwitchValues != switchValues)
+  {
+    if(isOn(switchValues, SHIFT_BTN))
+    {
+      shiftActive = true;
+    }
+    else
+    {
+      incrementScale();
+      shiftActive = false;
+    }
+    //chooseScale(switchValues);
+  }
+  prevSwitchValues = switchValues;
+  rootNote = inKey + freqShift;
+  outGain = kGainMap(mozziAnalogRead(GAIN_PIN));
+  if (noteBtnValues != prevNoteBtnValues)
+  {
+      newNote = findMostRecentlyPressedButton(noteBtnValues);
+      if(newNote < 8)
+      {
+        curNote = newNote;
+        envelopeAmp.noteOn();
+      }
+      else
+      {
+        envelopeAmp.noteOff();
+      }
+  }
+  midiNoteValue = (12 * octave) + (rootNote + scaleArray[curScale][curNote]);
+  carrier_freq = mtof(midiNoteValue);
+  aCarrier.setFreq(carrier_freq); 
+  outGain = kGainMap(mozziAnalogRead(GAIN_PIN));
+  envelopeAmp.setAttackTime(kAttackTimeMap(mozziAnalogRead(ATTACK_PIN)));
+  envelopeAmp.setReleaseTime(kDecayTimeMap(mozziAnalogRead(DECAY_PIN)));
+  envelopeAmp.update();
+  ampEnvGain = (envelopeAmp.next() * outGain) >> 8; 
+  PORTC = reverse_byte(noteBtnValues); // Note Trigger Buttons
+  octave = kMapOctave(mozziAnalogRead(KNOB_PIN));
+  mod_ratio = kRatioMap(mozziAnalogRead(RATIO_PIN));
+  int mod_freq = carrier_freq * mod_ratio;
+  aModulator.setFreq(mod_freq);
+  int LDR1_calibrated = kMapIntensity(mozziAnalogRead(FM_INTESNSITY_PIN));
+  fm_intensity = ((long)LDR1_calibrated * (kIntensityMod.next()+128))>>8; // shift back to range after 8 bit multiply
+  int LDR2_value= mozziAnalogRead(MOD_FREQ_PIN); // value is 0-1023
+  float mod_speed = (float)kMapModSpeed(LDR2_value)/1000;
+  kIntensityMod.setFreq(mod_speed);
+  if(shiftActive)
+  {
+    // int feedbackLevel = kDelayFeedbackMap(mozziAnalogRead(LFO_WAVEFORM_PIN));
+    // aDel.setFeedbackLevel(feedbackLevel); // can be -128 to 127
+    // // deltime = kDelayTimeMap(mozziAnalogRead(FREQ_SHIFT_PIN));
+    // deltime = mozziAnalogRead(FREQ_SHIFT_PIN);
+    // aDel.setDelayTimeCells(deltime);
+    // delayWet =  kDelayWetMap(mozziAnalogRead(WAVEFORM_PIN));
+    // int feedbackLevel = kDelayFeedbackMap(mozziAnalogRead(LFO_WAVEFORM_PIN));
+    // aDel.setFeedbackLevel(feedbackLevel); // can be -128 to 127
+    deltime = kDelayTimeMap(mozziAnalogRead(FREQ_SHIFT_PIN));
+    //deltime = mozziAnalogRead(FREQ_SHIFT_PIN);
+    aDel.set(deltime);
+    Serial.println(deltime);
+    // delayWet =  kDelayWetMap(mozziAnalogRead(WAVEFORM_PIN));
+  }
+  else
+  {
+    freqShift = kFreqShiftMap(mozziAnalogRead(FREQ_SHIFT_PIN));
+    int lfoWaveform = kMapWaveform(mozziAnalogRead(LFO_WAVEFORM_PIN));
+    int waveform = kMapWaveform(mozziAnalogRead(WAVEFORM_PIN));
+    chooseLFOTable(lfoWaveform);
+    chooseTable(waveform);
+  }
+}
+
+
+int updateAudio(){
+  long modulation = aSmoothIntensity.next(fm_intensity) * aModulator.next();
+  int outSignal = (aCarrier.phMod(modulation) * ampEnvGain) >> 8;
+  int delaySignal = (int)aDel.next(outSignal, deltime); 
+ // int outSignal = (((aCarrier.phMod(modulation)/(8 - (delayWet + 1))) + (aDel.next()/delayWet)) * ampEnvGain) >> 8;
+  //return asig/8 + aDel.next(asig, deltime); // mix some straight signal with the delayed signal
+   // if(envelopeAmp.playing() == false)
+   // {
+   //    outSignal = -244;
+   // }  
+  // return outSignal;
+  // return (outSignal + delayWetSignal) >> 1;
+  return delaySignal;
+}
+
+
+void loop(){
+  audioHook();
+}
+
+void chooseTable(int wave)
 {
-    audioHook(); // Required here
+        switch (wave)
+        {
+            case SAW:
+                aCarrier.setTable(SAW2048_DATA);
+                break;
+            case SIN:
+                aCarrier.setTable(SIN2048_DATA);
+                break;
+            case SQUARE:
+                aCarrier.setTable(SQUARE_NO_ALIAS_2048_DATA);
+                break;
+            case TRIANGLE:
+                aCarrier.setTable(TRIANGLE2048_DATA);
+                break;
+        }
+}
+
+void chooseLFOTable(int wave)
+{
+        switch (wave)
+        {
+            case SAW:
+                kIntensityMod.setTable(SAW2048_DATA);
+                break;
+            case SIN:
+                kIntensityMod.setTable(SIN2048_DATA);
+                break;
+            case SQUARE:
+                kIntensityMod.setTable(SQUARE_NO_ALIAS_2048_DATA);
+                break;
+            case TRIANGLE:
+                kIntensityMod.setTable(TRIANGLE2048_DATA);
+                break;
+        }
+}
+
+void incrementScale()
+{
+  Serial.println("CHOOSE SCALE");
+  int newScale = curScale + 1;
+  int numScales = (sizeof(scaleArray)/sizeof(int))/NOTES_PER_SCALE;
+  curScale = newScale == numScales ? 0 : newScale;
+}
+
+void chooseScale(int inUpOrDown)
+{
+  int changeAmt = inUpOrDown == 2 ? 1 : inUpOrDown == 1 ? -1 : 0;
+  int newScale = curScale + changeAmt;
+  int numScales = (sizeof(scaleArray)/sizeof(int))/NOTES_PER_SCALE;
+  int maxScaleIndex = numScales - 1;
+  curScale = newScale > maxScaleIndex ? maxScaleIndex : newScale < 0 ? 0 : newScale;
 }
 
 uint8_t findMostRecentlyPressedButton(uint8_t inByte)
@@ -189,15 +343,52 @@ uint8_t findMostRecentlyPressedButton(uint8_t inByte)
     int noteNumber = 8;
     for (uint8_t i = 0; i < 8; i++)
     {
-        if (newBtnValues & (buttonsBitMask << i))
+      if(newBtnValues == 0)
+      {
+          if ((inByte & (buttonsBitMask << i)) != 0)
+        {
+          noteNumber = i;
+
+            break;
+        }
+      }
+      else
+      {
+        if ((newBtnValues & (buttonsBitMask << i)) != 0)
         {
             noteNumber = i;
             break;
         }
+      }
         buttonsBitMask << 1;
     }
+    
     prevNoteBtnValues = inByte;
     return noteNumber;
+}
+
+boolean isOn(uint8_t inPortValue, uint8_t inPinMask)
+{
+  return (inPortValue * inPinMask) > 0;
+}
+
+void push(int inNoteNum)
+{
+  if(curStackIndex < STACK_SIZE - 1)
+  {
+    curStackIndex++;
+    noteStack[curStackIndex] = inNoteNum;
+  }
+}
+
+int pop()
+{
+  if(curStackIndex > -1)
+  {
+    curStackIndex--;
+    noteStack[curStackIndex] = curStackIndex;
+  }
+  return curStackIndex;
 }
 
 uint8_t reverse_byte(uint8_t a)
@@ -208,179 +399,8 @@ uint8_t reverse_byte(uint8_t a)
     ((a & 0x40) >> 5) | ((a & 0x80) >> 7);
 }
 
-// -----end Setup-----------------------------------------------------------------------------------
-void updateControl()
-{
-    noteBtnValues = (~PINL);
-    Serial.println(noteBtnValues, BIN);
-    if (noteBtnValues != prevNoteBtnValues)
-    {
-        newNote = findMostRecentlyPressedButton(noteBtnValues);
-        notePressedFlag = true;
-    }
-    else
-    {
-        newNote = 8;
-    }
-    PORTC = reverse_byte(noteBtnValues);
-    switch (curControl)
-    {
-        case 0:
-            octave = kMapOctave(mozziAnalogRead(OCTAVE_PIN));
-            break;
-        case 1:
-            octave = kMapOctave(mozziAnalogRead(OSC_FREQ_PIN));
-            break;
-        case 2:
-            gain = gainMap(mozziAnalogRead(GAIN_PIN));
-            break;
-        case 3:
-            attack_ms = attackIntMap(mozziAnalogRead(ATTACK_PIN));
-            break;
-        case 4:
-            release_ms = releaseIntMap(mozziAnalogRead(RELEASE_PIN));
-            break;
-        case 5:
-            LFOwaveformCheck = lfo_waveIntMap(mozziAnalogRead(LFOWaveForm_PIN));
-            if (LFOwaveformCheck != LFOWaveForm)
-            {
-                LFOWaveForm = LFOwaveformCheck;
-                 chooseLFOtable();
-                //lfo.setTable(lfoWaveforms[LFOwaveformCheck]);
-            }
-            break;
-        case 6:
-            lfo_speed = lfo_speedIntMap(mozziAnalogRead(LFO_FREQ_PIN));
-            break;
-        case 7:
-            lfo_depth = lfo_depthIntMap(mozziAnalogRead(LFO_DEPTH_PIN));
-            break;
-        case 8:
-            cutoff = cutoffIntMap(mozziAnalogRead(CUTOFF_PIN));
-            break;
-        case 9:
-        waveform = waveIntMap(mozziAnalogRead(WAVEFORM_PIN));
-        chooseTable();
-        break;
-        default:
-            break;
-    }
-    curControl = curControl > 9? 0:curControl + 1;
-    // detuneAmount = detuneAmount / 1000.0;
-    // chooseLFOtable();
-    // Serial.println(lfo_speed);
-    // Serial.println(cutoff - ((cutoff * gain_lfo1)>>8));
-    lfo.setFreq((int) lfo_speed);
-    uint8_t noteOnBitMask = 0x01;
-    for (int i = 0; i < NOTES_PER_SCALE; i++)
-    {
-        oscEnvelopes[i].setAttackTime(attack_ms);
-        oscEnvelopes[i].setReleaseTime(release_ms);
-        oscEnvelopes[i].update();
-        filters[i].setCutoffFreq(cutoff - ((cutoff * gain_lfo1) >> 8));
-        filters[i].setResonance(resLookup[waveform]);
-        if ((noteBtnValues & noteOnBitMask) != 0)
-        {
-            triggerValues[i] = 1;
-            if (newNote == i && notePressedFlag)
-            {
-                midiNoteValue = (12 * octave) + (inKey + scaleArray[inScale][newNote]);
-                freq = mtof(midiNoteValue);
-                oscillators[newNote].setFreq(freq);
-                // Serial.println(freq);
-                // oscillators2[newNote].setFreq(freq);
-                oscEnvelopes[i].noteOn();
-                notePressedFlag = false;
-                // 
-            }
-            // gain_adsr[i] = oscEnvelopes[i].next();
-            // Serial.println(gain_adsr[i]);
-        }
-        else
-        {
-            triggerValues[i] = 0;
-            oscEnvelopes[i].noteOff();
-            // gain_adsr[i] = 0;
-        }
-        gain_adsr[i] = oscEnvelopes[i].next();
-        noteOnBitMask <<= 1;
-    }
-}
 
-void chooseTable()
-{
-    for (int i = 0; i < NUM_OSCILLATORS; i++)
-    {
-        switch (waveform)
-        {
-            case SAW:
-                oscillators[i].setTable(SAW2048_DATA);
-                // oscillators2[i].setTable(SAW2048_DATA);
-                break;
-            case SIN:
-                oscillators[i].setTable(SIN2048_DATA);
-                // oscillators2[i].setTable(SIN2048_DATA);
-                break;
-            case SQUARE:
-                oscillators[i].setTable(SQUARE_NO_ALIAS_2048_DATA);
-                // oscillators2[i].setTable(SQUARE_NO_ALIAS_2048_DATA);
-                break;
-            case TRIANGLE:
-                oscillators[i].setTable(TRIANGLE2048_DATA);
-                // oscillators2[i].setTable(TRIANGLE2048_DATA);
-                break;
-        }
-    }
-}
 
-void chooseLFOtable()
-{
-    switch (LFOWaveForm)
-    {
-        case SAW:
-            lfo.setTable(SAW512_DATA);
-            break;
-        case SIN:
-            lfo.setTable(SIN512_DATA);
-            break;
-        case SQUARE:
-            lfo.setTable(SQUARE_NO_ALIAS512_DATA);
-            break;
-        case TRIANGLE:
-            lfo.setTable(TRIANGLE512_DATA);
-            break;
-    }
-    // gain_lfo1 = (int)((long)(lfo.next() + 128) * lfo_depth) >> 8;
-    // gain_lfo1 = (int)((lfo.next() + 128) * lfo_depth) >> 8;
-    gain_lfo1 = (int) (lfo.next() * lfo_depth) >> 8;
-}
 
-int updateAudio()
-{
-    long outputValue = 0;
-    uint8_t bMask = 0x01;
-    for (int i = 0; i < 8; i++)
-    {
-        outputValue += (int) (oscillators[i].next() * gain_adsr[i] * (bMask & noteBtnValues)) >> 8;
-        // int oscValue = (int)(oscillators[i].next() * gain_adsr[i] * (bMask & noteBtnValues)) >> 8;
-        // int oscValue = (int)(oscillators[i].next() * gain_adsr[i] * (bMask & noteBtnValues)) >> 8;
-        // outputValue += oscValue;
-        // int oscValue = (int)(filters[i].next(oscillators[i].next()) * gain_adsr[i]) >> 8;
-        // if (triggerValues[i] != 0)
-        // {
-        // outputValue += oscValue;
-        // }
-        bMask <<= 1;
-    }
-    return(long) (outputValue * gain) >> 8;
-}
 
-void switchToggledUp()
-{
-    inScale = inScale + 1 > 4? 4:inScale + 1;
-}
 
-void switchToggledDown()
-{
-    inScale = inScale - 1 < 0? 0:inScale - 1;
-}
